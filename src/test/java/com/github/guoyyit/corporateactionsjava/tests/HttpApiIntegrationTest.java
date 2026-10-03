@@ -129,4 +129,64 @@ class HttpApiIntegrationTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("NOT_FOUND"));
     }
+
+    @Test
+    void dividendAdjustmentAndErrorSemanticsThroughHttp() throws Exception {
+        // 前收盘 10.00，除息日收盘 9.00，每股分红 1.00
+        mockMvc.perform(post("/api/prices")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"symbol":"DIV","points":[
+                                  {"date":"2024-03-04","close":10.00},
+                                  {"date":"2024-03-05","close":9.00}
+                                ]}
+                                """))
+                .andExpect(status().isNoContent());
+
+        String created = mockMvc.perform(post("/api/actions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"symbol":"DIV","effectiveDate":"2024-03-05",
+                                 "params":{"kind":"DIVIDEND","perShare":1.00}}
+                                """))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        Matcher matcher = ID_PATTERN.matcher(created);
+        matcher.find();
+        String eventId = matcher.group(1);
+
+        // 后复权除息日回到 10.00，前复权除息日前一日下压至 9.00
+        mockMvc.perform(get("/api/prices/DIV").param("view", "ALL"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.points[0].raw").value(10.0))
+                .andExpect(jsonPath("$.points[0].forward").value(9.0))
+                .andExpect(jsonPath("$.points[0].backward").value(10.0))
+                .andExpect(jsonPath("$.points[1].raw").value(9.0))
+                .andExpect(jsonPath("$.points[1].forward").value(9.0))
+                .andExpect(jsonPath("$.points[1].backward").value(10.0));
+
+        // 把分红修正为 150（>= 前收盘 10.00）：复权口径返回 422 与可区分错误码
+        mockMvc.perform(put("/api/actions/" + eventId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"symbol":"DIV","effectiveDate":"2024-03-05",
+                                 "params":{"kind":"DIVIDEND","perShare":150}}
+                                """))
+                .andExpect(status().isOk());
+        mockMvc.perform(get("/api/prices/DIV").param("view", "ALL"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.code").value("DIVIDEND_EXCEEDS_PREVIOUS_CLOSE"));
+        // 未复权口径不受影响
+        mockMvc.perform(get("/api/prices/DIV").param("view", "RAW"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.points[0].raw").value(10.0))
+                .andExpect(jsonPath("$.points[1].raw").value(9.0));
+
+        // 撤销后查询恢复
+        mockMvc.perform(delete("/api/actions/" + eventId))
+                .andExpect(status().isNoContent());
+        mockMvc.perform(get("/api/prices/DIV").param("view", "ALL"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.points[1].backward").value(9.0));
+    }
 }

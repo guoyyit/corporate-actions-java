@@ -25,6 +25,10 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.BAD_REQUEST, "INVALID_PARAM", message);
     }
 
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
+    }
+
     public static ApiException duplicate(String message) {
         return new ApiException(HttpStatus.CONFLICT, "DUPLICATE_EVENT", message);
     }

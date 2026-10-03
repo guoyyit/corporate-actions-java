@@ -27,6 +27,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.springframework.http.HttpStatus;
 
 class CorporateActionServiceTest {
 
@@ -189,5 +191,87 @@ class CorporateActionServiceTest {
         ApiException ex = assertThrows(ApiException.class,
                 () -> service.revoke("no-such-id"));
         assertEquals("NOT_FOUND", ex.code());
+    }
+
+    @Test
+    void dividendExceedingPreviousCloseFailsAdjustedViewsButNotRawView() {
+        // 前收盘 100，每股红利 150：除息后价格为负，事件本身允许登记
+        ActionResponse registered = service.register(dividend("2024-01-03", "150"));
+
+        // 复权口径查询返回明确且可区分的错误
+        ApiException all = assertThrows(ApiException.class,
+                () -> service.query("AAA", PriceView.ALL, null, null));
+        assertEquals("DIVIDEND_EXCEEDS_PREVIOUS_CLOSE", all.code());
+        assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, all.status());
+        ApiException forward = assertThrows(ApiException.class,
+                () -> service.query("AAA", PriceView.FORWARD, null, null));
+        assertEquals("DIVIDEND_EXCEEDS_PREVIOUS_CLOSE", forward.code());
+        ApiException backward = assertThrows(ApiException.class,
+                () -> service.query("AAA", PriceView.BACKWARD, null, null));
+        assertEquals("DIVIDEND_EXCEEDS_PREVIOUS_CLOSE", backward.code());
+
+        // 未复权口径不受影响，仍返回原始价格
+        PriceSeriesResponse raw = service.query("AAA", PriceView.RAW, null, null);
+        assertEquals(PRICES.size(), raw.points().size());
+        assertEquals(0, new BigDecimal("100").compareTo(raw.points().get(0).raw()));
+        assertEquals(0, new BigDecimal("95").compareTo(raw.points().get(1).raw()));
+        // 原始价格均为正数，无零价格/负价格
+        assertTrue(raw.points().stream().allMatch(
+                point -> point.raw().signum() > 0
+                        && point.forward().signum() > 0
+                        && point.backward().signum() > 0));
+
+        // 其他标的不受影响
+        service.ingestPrices(new IngestPricesRequest("BBB", List.of(
+                new PricePointRequest(LocalDate.parse("2024-01-02"), new BigDecimal("50")),
+                new PricePointRequest(LocalDate.parse("2024-01-03"), new BigDecimal("51")))));
+        assertEquals(2, service.query("BBB", PriceView.ALL, null, null).points().size());
+
+        // 修正事件参数后恢复合法，查询立即恢复正确结果
+        service.modify(registered.id(), dividend("2024-01-03", "10"));
+        PriceSeriesResponse recovered = service.query("AAA", PriceView.ALL, null, null);
+        // 前收盘 100、分红 10：后复权除息日 = 95 * 100/90 ≈ 105.56
+        assertEquals("105.56", recovered.points().get(1).backward().toPlainString());
+        assertEquals("90", recovered.points().get(0).forward().toPlainString());
+    }
+
+    @Test
+    void missingPrecedingCloseFailsQueryAndRecoversAfterBackfill() {
+        // 在序列首个交易日登记分红：生效日之前不存在任何收盘价
+        service.register(dividend("2024-01-02", "10"));
+
+        ApiException ex = assertThrows(ApiException.class,
+                () -> service.query("AAA", PriceView.ALL, null, null));
+        assertEquals("MISSING_PRECEDING_CLOSE", ex.code());
+        assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, ex.status());
+
+        // 未复权口径仍可用
+        assertEquals(PRICES.size(),
+                service.query("AAA", PriceView.RAW, null, null).points().size());
+
+        // 补录生效日之前的历史价格后恢复合法
+        service.ingestPrices(new IngestPricesRequest("AAA", List.of(
+                new PricePointRequest(LocalDate.parse("2023-12-29"), new BigDecimal("120")))));
+        PriceSeriesResponse recovered = service.query("AAA", PriceView.ALL, null, null);
+        assertEquals(PRICES.size() + 1, recovered.points().size());
+        // 前收盘 120、分红 10：后复权除息日 = 100 * 120/110 ≈ 109.09
+        assertEquals("109.09", recovered.points().get(1).backward().toPlainString());
+    }
+
+    @Test
+    void revokeOfInvalidEventRestoresQuery() {
+        // 登记与撤销对非法事件行为一致：均只按结构校验，不检查价格
+        ActionResponse registered = service.register(dividend("2024-01-03", "150"));
+        assertThrows(ApiException.class,
+                () -> service.query("AAA", PriceView.ALL, null, null));
+
+        service.revoke(registered.id());
+        PriceSeriesResponse response = service.query("AAA", PriceView.ALL, null, null);
+        assertEquals(PRICES.size(), response.points().size());
+        // 撤销后无事件，三种口径价格一致
+        assertEquals(0, response.points().get(1).raw()
+                .compareTo(response.points().get(1).backward()));
+        assertEquals(0, response.points().get(1).raw()
+                .compareTo(response.points().get(1).forward()));
     }
 }

@@ -10,6 +10,7 @@ import com.github.guoyyit.corporateactionsjava.dto.IngestPricesRequest;
 import com.github.guoyyit.corporateactionsjava.dto.PricePointRequest;
 import com.github.guoyyit.corporateactionsjava.dto.PriceSeriesResponse;
 import com.github.guoyyit.corporateactionsjava.dto.RegisterActionRequest;
+import com.github.guoyyit.corporateactionsjava.error.AdjustmentException;
 import com.github.guoyyit.corporateactionsjava.error.ApiException;
 import com.github.guoyyit.corporateactionsjava.store.JsonStateStore;
 import jakarta.annotation.PostConstruct;
@@ -17,6 +18,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -165,8 +167,14 @@ public class CorporateActionService {
             List<AdjustedPoint> points;
             try {
                 points = engine.compute(normalized, symbolPrices, symbolActions, tick);
-            } catch (IllegalStateException ex) {
-                throw ApiException.invalidParam(ex.getMessage());
+            } catch (AdjustmentException ex) {
+                if (view == PriceView.RAW) {
+                    // 未复权口径不依赖除权因子：事件数据不一致时仍返回原始价格，
+                    // 因子与前后复权字段以中性值占位，不影响其他标的与其他口径。
+                    points = rawOnlyPoints(symbolPrices);
+                } else {
+                    throw ApiException.unprocessable(ex.code(), ex.getMessage());
+                }
             }
             List<AdjustedPoint> filtered = points.stream()
                     .filter(point -> from == null || !point.date().isBefore(from))
@@ -176,6 +184,19 @@ public class CorporateActionService {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private List<AdjustedPoint> rawOnlyPoints(List<RawPrice> symbolPrices) {
+        return symbolPrices.stream()
+                .sorted(Comparator.comparing(RawPrice::date))
+                .map(price -> {
+                    BigDecimal raw = price.close()
+                            .setScale(4, RoundingMode.HALF_UP);
+                    BigDecimal neutral = AdjustmentEngine.roundToTick(price.close(), tick);
+                    return new AdjustedPoint(price.date(), raw, neutral, neutral,
+                            BigDecimal.ONE.setScale(12, RoundingMode.HALF_UP));
+                })
+                .toList();
     }
 
     private void validate(RegisterActionRequest request) {

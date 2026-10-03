@@ -70,6 +70,41 @@ class PersistenceAndConcurrencyTest {
     }
 
     @Test
+    void restartRestoresDividendAndRightsEventsIdentically() {
+        Path dataFile = tempDir.resolve("state-dividend-rights.json");
+        CorporateActionService first = newService(dataFile);
+        first.ingestPrices(new IngestPricesRequest("AAA", List.of(
+                new PricePointRequest(LocalDate.parse("2024-03-04"), new BigDecimal("10.00")),
+                new PricePointRequest(LocalDate.parse("2024-03-05"), new BigDecimal("9.00")),
+                new PricePointRequest(LocalDate.parse("2024-03-06"), new BigDecimal("8.31")))));
+        first.register(new RegisterActionRequest("AAA",
+                LocalDate.parse("2024-03-05"),
+                new ActionParams.DividendParams(new BigDecimal("1.00"))));
+        first.register(new RegisterActionRequest("AAA",
+                LocalDate.parse("2024-03-06"),
+                new ActionParams.RightsIssueParams(
+                        new BigDecimal("0.3"), new BigDecimal("6.00"))));
+
+        PriceSeriesResponse beforeRestart =
+                first.query("AAA", PriceView.ALL, null, null);
+
+        CorporateActionService restarted = newService(dataFile);
+        PriceSeriesResponse afterRestart =
+                restarted.query("AAA", PriceView.ALL, null, null);
+
+        // 重启前后复权结果逐点一致，事件不丢失、不重复应用
+        assertEquals(beforeRestart.points(), afterRestart.points());
+        assertEquals(2, restarted.list("AAA").size());
+        // 分红区间后复权连续：除息日 9.00 回到前收盘 10.00
+        assertEquals("10", afterRestart.points().get(0).backward().toPlainString());
+        assertEquals("10", afterRestart.points().get(1).backward().toPlainString());
+        // 配股区间后复权连续：8.31 回到约 10.00（误差不超过一个最小价格单位）
+        assertTrue(afterRestart.points().get(2).backward()
+                .subtract(new BigDecimal("10.00")).abs()
+                .compareTo(new BigDecimal("0.01")) <= 0);
+    }
+
+    @Test
     void concurrentRegistrationsAndQueriesStayConsistent() throws Exception {
         Path dataFile = tempDir.resolve("state.json");
         CorporateActionService service = newService(dataFile);
@@ -84,7 +119,7 @@ class PersistenceAndConcurrencyTest {
         AtomicInteger success = new AtomicInteger();
         AtomicInteger rejected = new AtomicInteger();
 
-        // 每个线程在不同日期登记拆股（全部应成功），另有读取线程持续验证快照完整性
+        // 每个线程在不同日期登记混合类型事件（全部应成功），另有读取线程持续验证快照完整性
         List<Thread> readers = new ArrayList<>();
         AtomicInteger readErrors = new AtomicInteger();
         for (int readerIndex = 0; readerIndex < 4; readerIndex++) {
@@ -109,11 +144,16 @@ class PersistenceAndConcurrencyTest {
 
         for (int index = 0; index < threads; index++) {
             LocalDate date = LocalDate.of(2024, 2, 1).plusDays(index);
+            ActionParams params = switch (index % 3) {
+                case 0 -> new ActionParams.SplitParams(new BigDecimal("2"));
+                case 1 -> new ActionParams.DividendParams(new BigDecimal("1"));
+                default -> new ActionParams.RightsIssueParams(
+                        new BigDecimal("0.3"), new BigDecimal("5"));
+            };
             pool.submit(() -> {
                 try {
                     start.await();
-                    service.register(new RegisterActionRequest("AAA", date,
-                            new ActionParams.SplitParams(new BigDecimal("2"))));
+                    service.register(new RegisterActionRequest("AAA", date, params));
                     success.incrementAndGet();
                 } catch (ApiException ex) {
                     rejected.incrementAndGet();
@@ -132,9 +172,19 @@ class PersistenceAndConcurrencyTest {
         assertEquals(0, readErrors.get(), "并发期间查询观察到了不完整快照");
         assertEquals(threads, service.list("AAA").size());
 
+        // 全部事件（含分红与配股）生效后，三种口径查询均正常且价格为正
+        PriceSeriesResponse series = service.query("AAA", PriceView.ALL, null, null);
+        assertEquals(3, series.points().size());
+        assertTrue(series.points().stream().allMatch(point ->
+                point.factor().signum() > 0
+                        && point.forward().signum() > 0
+                        && point.backward().signum() > 0));
+
         // 持久化文件仍可恢复出同样数量的事件
         CorporateActionService restarted = newService(dataFile);
         assertEquals(threads, restarted.list("AAA").size());
+        assertEquals(series.points(),
+                restarted.query("AAA", PriceView.ALL, null, null).points());
     }
 
     @Test

@@ -4,6 +4,7 @@ import com.github.guoyyit.corporateactionsjava.domain.ActionParams;
 import com.github.guoyyit.corporateactionsjava.domain.AdjustedPoint;
 import com.github.guoyyit.corporateactionsjava.domain.CorporateAction;
 import com.github.guoyyit.corporateactionsjava.domain.RawPrice;
+import com.github.guoyyit.corporateactionsjava.error.AdjustmentException;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -18,16 +19,25 @@ import java.util.List;
  *
  * <p>后复权因子定义：以价格序列首个交易日为基准日（基准因子=1），
  * 公司行为在生效日（除权除息日）当日及之后的因子上生效。
+ * 后复权口径保持除权日之前的价格不变，把除权日（含）之后的价格
+ * 调回除权前水平，使序列在除权除息日连续。
  *
  * <p>单个事件的日因子：
  * <ul>
  *   <li>拆股 {@code ratio = newShares / oldShares}（&gt;1）：r = ratio</li>
  *   <li>合并（缩股）{@code ratio = newShares / oldShares}（&lt;1）：r = ratio</li>
- *   <li>分红：r = (P - d) / P，P 为生效日前最后一个交易日的原始收盘价，d 为每股红利</li>
- *   <li>配股：r = (P + s*p) / (P*(1+s))，s 为配股比例，p 为配股价</li>
+ *   <li>分红：r = P / (P - d)，P 为生效日前最后一个交易日的原始收盘价，d 为每股红利。
+ *       除息参考价为 P - d，当生效日原始收盘价等于 P - d 时，
+ *       后复权价 = (P - d) * r = P，与前收盘完全连续</li>
+ *   <li>配股：r = P*(1+s) / (P + s*p)，s 为配股比例，p 为配股价。
+ *       除权参考价为 (P + s*p) / (1+s)，当生效日原始收盘价等于该参考价时，
+ *       后复权价回到 P，与前收盘完全连续</li>
  * </ul>
  * 所有除法统一 {@link RoundingMode#HALF_UP}、固定 34 位精度，因此无论事件如何
  * 分组逐条应用还是整体重放，连乘结果逐位一致。
+ *
+ * <p>数据不一致时抛出 {@link AdjustmentException}：生效日之前没有任何
+ * 原始收盘价，或每股红利大于等于前收盘价（会产生零/负价格）。
  */
 @Component
 public class AdjustmentEngine {
@@ -113,15 +123,25 @@ public class AdjustmentEngine {
         }
         if (params instanceof ActionParams.DividendParams dividend) {
             BigDecimal previousClose = previousClose(sortedPrices, effectiveDate);
-            return previousClose.subtract(dividend.perShare())
-                    .divide(previousClose, MATH_SCALE, RoundingMode.HALF_UP);
+            BigDecimal exDividendClose = previousClose.subtract(dividend.perShare());
+            if (exDividendClose.signum() <= 0) {
+                throw new AdjustmentException(
+                        AdjustmentException.CODE_DIVIDEND_EXCEEDS_PREVIOUS_CLOSE,
+                        "标的 " + action.symbol() + " 在 " + effectiveDate
+                                + " 的每股红利 " + dividend.perShare()
+                                + " 大于等于前收盘价 " + previousClose
+                                + "，除息后价格将为零或负数，无法复权");
+            }
+            return previousClose
+                    .divide(exDividendClose, MATH_SCALE, RoundingMode.HALF_UP);
         }
         if (params instanceof ActionParams.RightsIssueParams rights) {
             BigDecimal previousClose = previousClose(sortedPrices, effectiveDate);
             BigDecimal ratio = rights.ratio();
-            BigDecimal denominator = previousClose.multiply(BigDecimal.ONE.add(ratio));
-            return previousClose.add(ratio.multiply(rights.subscriptionPrice()))
-                    .divide(denominator, MATH_SCALE, RoundingMode.HALF_UP);
+            BigDecimal exRightsReference =
+                    previousClose.add(ratio.multiply(rights.subscriptionPrice()));
+            return previousClose.multiply(BigDecimal.ONE.add(ratio))
+                    .divide(exRightsReference, MATH_SCALE, RoundingMode.HALF_UP);
         }
         throw new IllegalStateException("未知事件参数类型: " + params);
     }
@@ -136,8 +156,9 @@ public class AdjustmentEngine {
             }
         }
         if (previous == null) {
-            throw new IllegalStateException(
-                    "生效日 " + effectiveDate + " 之前缺少原始收盘价，无法计算除权因子");
+            throw new AdjustmentException(
+                    AdjustmentException.CODE_MISSING_PRECEDING_CLOSE,
+                    "生效日 " + effectiveDate + " 之前缺少原始收盘价，无法确定除权基准价");
         }
         return previous;
     }

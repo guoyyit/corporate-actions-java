@@ -75,5 +75,25 @@ class NumericalStabilityTest {
             assertTrue(point.forward().signum() >= 0);
             assertTrue(point.backward().signum() >= 0);
         }
+
+        // 200 个混合事件叠加后，任意交易日三口径换算误差均不超过一个最小价格单位。
+        // 若误差随事件数量累积放大，序列后段的偏差会率先突破该界限。
+        BigDecimal latestFactor = replay.get(replay.size() - 1).factor();
+        BigDecimal maxBackwardError = BigDecimal.ZERO;
+        BigDecimal maxForwardError = BigDecimal.ZERO;
+        for (AdjustedPoint point : replay) {
+            BigDecimal backwardError = point.backward()
+                    .subtract(point.raw().multiply(point.factor())).abs();
+            BigDecimal forwardError = point.forward()
+                    .subtract(point.backward().divide(latestFactor, 10,
+                            java.math.RoundingMode.HALF_UP))
+                    .abs();
+            maxBackwardError = maxBackwardError.max(backwardError);
+            maxForwardError = maxForwardError.max(forwardError);
+        }
+        assertTrue(maxBackwardError.compareTo(tick) <= 0,
+                "后复权换算误差超过一个最小价格单位: " + maxBackwardError);
+        assertTrue(maxForwardError.compareTo(tick) <= 0,
+                "前复权换算误差超过一个最小价格单位: " + maxForwardError);
     }
 }
