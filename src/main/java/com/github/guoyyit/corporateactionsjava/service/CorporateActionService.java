@@ -11,12 +11,14 @@ import com.github.guoyyit.corporateactionsjava.dto.PricePointRequest;
 import com.github.guoyyit.corporateactionsjava.dto.PriceSeriesResponse;
 import com.github.guoyyit.corporateactionsjava.dto.RegisterActionRequest;
 import com.github.guoyyit.corporateactionsjava.error.ApiException;
+import com.github.guoyyit.corporateactionsjava.error.AdjustmentException;
 import com.github.guoyyit.corporateactionsjava.store.JsonStateStore;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -165,8 +167,16 @@ public class CorporateActionService {
             List<AdjustedPoint> points;
             try {
                 points = engine.compute(normalized, symbolPrices, symbolActions, tick);
-            } catch (IllegalStateException ex) {
-                throw ApiException.invalidParam(ex.getMessage());
+            } catch (AdjustmentException ex) {
+                if (view == PriceView.RAW) {
+                    // RAW 口径不依赖复权因子：即使复权数据不合法，原始价格仍可返回，
+                    // 不影响该标的 RAW 口径的查询。
+                    points = rawPoints(normalized, symbolPrices);
+                } else {
+                    throw new ApiException(
+                            org.springframework.http.HttpStatus.BAD_REQUEST,
+                            ex.code(), ex.getMessage());
+                }
             }
             List<AdjustedPoint> filtered = points.stream()
                     .filter(point -> from == null || !point.date().isBefore(from))
@@ -176,6 +186,17 @@ public class CorporateActionService {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private List<AdjustedPoint> rawPoints(String symbol, List<RawPrice> prices) {
+        return prices.stream()
+                .filter(price -> symbol.equals(price.symbol()))
+                .sorted(Comparator.comparing(RawPrice::date))
+                .map(price -> new AdjustedPoint(
+                        price.date(),
+                        price.close().setScale(4, RoundingMode.HALF_UP),
+                        null, null, null))
+                .toList();
     }
 
     private void validate(RegisterActionRequest request) {
